@@ -1,0 +1,250 @@
+---
+title: "1. GPS-GSM data pre-filtering"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    collapsed: true
+    smooth_scroll: true
+---
+
+```{r setup, eval=TRUE, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+Filtering of flight locations, speeds, and bursts (specific to GPS-GSM tracked birds)
+
+# Libraries
+
+```{r}
+
+if (!require(readr)) install.packages("readr")
+if (!require(readxl)) install.packages("readxl")
+if (!require(dplyr)) install.packages("dplyr")
+if (!require(lubridate)) install.packages("lubridate")
+if (!require(raster)) install.packages("raster")
+if (!require(SDLfilter)) install.packages("SDLfilter")
+if (!require(sf)) install.packages("sf")
+
+library(readr)
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(raster)
+library(SDLfilter)
+library(sf)
+
+```
+
+# Set directory and folders
+
+Set the working directory where the files are located
+
+```{r}
+
+setwd("C:/Users/...")
+folder <- "C:/Users/..."
+
+# Obtain the list of CSV and Excel files in the folder.
+# The following lines open the CSV and Excel files in the folder
+# Preferably, these should all be CSV files downloaded directly from Movebank (or Excel files if not available)
+# If there are both CSV and Excel files, errors may occur when merging the databases
+
+csv_files <- list.files(folder, pattern = "\\.csv$", full.names = TRUE)
+
+```
+
+# Functions
+
+## Function to read CSV files
+
+```{r}
+
+read_file <- function(file) {
+  
+  if (grepl("\\.csv$", file)) {
+    data <- read_csv(file, show_col_types = FALSE)
+    }
+  
+  # Convert all columns to character type to avoid errors when merging
+  data <- mutate_all(data, as.character)
+  
+  return(data)
+  
+  }
+
+```
+
+## Function to identify and filter the Bursts
+
+Within a burst, keep data with \> satellite count and \< hdop
+
+```{r}
+
+process_burst <- function(df) {
+  
+  df$DateTime <- as_datetime(df$DateTime)   
+  
+  df$DateTime2 <- c(df$DateTime[1], df$DateTime[-length(df$DateTime)])
+  
+  df$diff <- difftime(df$DateTime, df$DateTime2)
+  df$diff <- as.numeric(df$diff)
+  
+  condition <- df$diff > 3
+  df$burst_ID <- cumsum(condition)
+  
+  df <- df %>%
+    group_by(burst_ID) %>%
+    filter(
+      (is.na(`gps:satellite-count`) | `gps:satellite-count` == max(`gps:satellite-count`, na.rm = TRUE)) &
+        (is.na(`gps:hdop`) | `gps:hdop` == min(`gps:hdop`, na.rm = TRUE))
+    ) %>%
+    ungroup()
+  
+  df <- df %>%
+    distinct(burst_ID, .keep_all = TRUE) %>%
+    dplyr::select(-DateTime2)
+  
+  return(df)
+  
+  }
+
+```
+
+# Load and prepare data
+
+```{r}
+
+# Load necessary files
+
+elevation <- raster("C:/Users/.../elevation.tif")
+
+data_list <- lapply(c(csv_files), read_file) 
+unified_data <- bind_rows(data_list)
+
+# Convert variables
+
+unified_data$species_name <- as.factor(unified_data$`individual-taxon-canonical-name`) 
+
+unified_data$id <- as.factor(unified_data$`individual-local-identifier`) 
+
+unified_data$DateTime <- as.POSIXct(unified_data$timestamp, format = "%Y-%m-%d %H:%M:%S", tz = "UTC") 
+
+unified_data$lon <- as.numeric(unified_data$`location-long`) 
+unified_data$lat <- as.numeric(unified_data$`location-lat`) 
+
+unified_data$`height-above-ellipsoid` <- as.numeric(unified_data$`height-above-ellipsoid`) 
+unified_data$`height-above-msl` <- as.numeric(unified_data$`height-above-msl`) 
+unified_data$`height-raw` <- as.numeric(unified_data$`height-raw`) 
+
+unified_data <- unified_data %>% mutate(line_number = row_number())
+
+```
+
+# Remove outliers
+
+Remove points with latitude and longitude equal to 200 (Movebank outliers) Remove rows where DateTime is NA
+
+```{r}
+
+unified_data <- unified_data %>%
+  dplyr::filter(!(lat == 200 & lon ==200)) %>%
+  dplyr::filter(!(is.na(DateTime))) %>%
+  arrange(id, DateTime)
+
+```
+
+# Loop for each species
+
+```{r}
+
+# List to store results
+
+results <- list()
+
+for (individual in unique(unified_data$`id`)) {
+  
+  individual_data <- subset(unified_data, `id` == individual)
+  
+  # Species-specific: Tetrax tetrax Apply different code according to the species
+  
+  if (unique(individual_data$species_name) == "Tetrax tetrax") {
+    
+    # 1. Filter the Bursts
+    individual_data <- process_burst(individual_data)
+    
+    # 2. Filter of heights
+    # In cases where there is no height above sea level -> calculate it using the Digital Elevation Model
+    
+    # Extract the 'elevation' value for each location
+    individual_data$elevation_value <- extract(elevation,
+                                               cbind(individual_data$'lon',
+                                                     individual_data$'lat'))
+    
+    # Fill 'height-above-msl' where it is NA
+    
+    individual_data$`height-above-msl` <- ifelse(
+      is.na(individual_data$`height-above-msl`), 
+      individual_data$`height-above-ellipsoid` - individual_data$elevation_value,
+      individual_data$`height-above-msl`
+      )
+    
+    # Filter data where height-above-msl is within the range of elevation ±20 m
+    # (species-specific: adjust the desired range for other species)
+    
+    individual_data <- individual_data %>%
+    filter(`height-above-msl` >= elevation_value - 20 & `height-above-msl` <= elevation_value + 20)
+      
+    # 3. Filter locations with repeated DateTime and coordinates
+      
+    individual_data <- individual_data[order(individual_data$DateTime),]
+      
+    duplicatedLocs <- which(individual_data$DateTime[1:(nrow(individual_data)-1)] == individual_data$DateTime[2:(nrow(individual_data))])
+      
+    if (length(duplicatedLocs) >= 1) {individual_data <- individual_data[-duplicatedLocs,] }
+      
+    } 
+  
+  else if (unique(individual_data$species_name) == "Burhinus oedicnemus") {
+    
+    # (Repeat similar steps for each species)
+    # Code for "Burhinus oedicnemus"
+    
+    }
+  
+  # Save in the result list
+  
+  results[[individual]] <- individual_data
+  
+  }
+
+
+# Combine all processed data into a single dataframe
+
+processed_data <- do.call(rbind, results)
+
+```
+
+# Review results
+
+```{r}
+
+head(processed_data)
+
+table(unified_data$species_name)
+table(processed_data$species_name)
+
+```
+
+# Filter by years 2022 and 2023 and write csv
+
+```{r}
+
+processed_data <- processed_data %>% mutate(timestamp = as.POSIXct(timestamp))
+
+processed_data <- processed_data %>% filter(format(timestamp, "%Y") %in% c("2022", "2023"))
+
+write.csv(processed_data, "preprocessed_data.csv", row.names = FALSE)
+
+```

@@ -1,0 +1,148 @@
+---
+title: "5. Models construction"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    collapsed: true
+    smooth_scroll: true
+---
+
+```{r setup, eval=TRUE, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+In this analysis, code is intended for BACI models, including an interaction between treatment status and year [2022 (before measure aplication) vs 2023 (year of measure implementation)]. 
+
+Treatment status indicates whether a plot received CAP measures in 2023 (treated) or remained untreated (control). 
+
+For the BACI analyses, plots designated as treated in 2023 are coded as to be treated in 2022, allowing for the assessment of temporal changes in species presence attributable to the implementation of CAP measures.
+Consequently, the interaction between treatment status and year quantifies the effect of treatment while controlling for baseline differences between plots.
+
+## Libraries
+
+```{r}
+
+if (!require(readr)) install.packages("readr")
+if (!require(dplyr)) install.packages("dplyr")
+if (!require(stringr)) install.packages("stringr")
+if (!require(glmmTMB)) install.packages("glmmTMB")
+if (!require(DHARMa)) install.packages("DHARMa")
+if (!require(performance)) install.packages("performance")
+
+library(readr)    
+library(dplyr)      
+library(stringr)     
+library(glmmTMB)  
+library(DHARMa)
+library(performance)
+
+```
+
+## Load and prepare data
+
+The following code is built upon models incorporating land use data (SIGPAC) and the uptake of CAP 2023 measures. It is designed to facilitate an analysis comparing data from 2022 and 2023, focusing on a before-after evaluation of the CAP measures.
+
+```{r}
+
+BIRDSDF2223 <- read_csv("POINTS_UPTK_USE_COL.csv")
+
+# If necessary, filter out points without land use information. In our analysis, this step is used to exclude points located outside of Spain (e.g., along the Extremadura border with Portugal), which were generated during the kernel density analysis but are not relevant for our study
+
+BIRDSDF2223 <- BIRDSDF2223 %>% filter(!is.na(SIGPAC))
+
+
+# Extract information on species and year that was previously merged into the 'id' variable
+BIRDSDF2223$SP <- substr(BIRDSDF2223$id, 1, 2)
+BIRDSDF2223$YEAR <- substr(BIRDSDF2223$id, nchar(BIRDSDF2223$id) - 3, nchar(BIRDSDF2223$id))
+BIRDSDF2223$id <- substr(BIRDSDF2223$id, 1, nchar(BIRDSDF2223$id) - 5)
+
+# Rename variables as needed for clarity and consistency. In this example, we are recoding variables related to eco-schemes and rural development measures
+names(BIRDSDF2223)[names(BIRDSDF2223) == "id"] <- "ID"
+names(BIRDSDF2223)[names(BIRDSDF2223) == "ruraldevelopmentmeasurescodes"] <- "PDR"
+names(BIRDSDF2223)[names(BIRDSDF2223) == "ecoschemesmeasurescodes"] <- "ES"
+
+BIRDSDF2223$SIGPAC <- as.factor(BIRDSDF2223$SIGPAC)
+BIRDSDF2223$ID <- as.factor(BIRDSDF2223$ID) 
+BIRDSDF2223$SP <- as.factor(BIRDSDF2223$SP)
+BIRDSDF2223$YEAR <- as.factor(BIRDSDF2223$YEAR)
+BIRDSDF2223$AC <- as.factor(BIRDSDF2223$AC)
+
+```
+
+## Inclusion of uptake information based on the codification for each specific measure
+
+```{r}
+
+BIRDSDF2223 <- BIRDSDF2223 %>% mutate(BiodivSites = ifelse(grepl("5041", ES), "YES", "NO")) 
+BIRDSDF2223$BiodivSites <- as.factor(BIRDSDF2223$BiodivSites)
+
+BIRDSDF2223 <- BIRDSDF2223 %>% 
+mutate(BirdProtec = ifelse(grepl("7651010701|8651011401|9651010701|9010010754|10651010701", PDR), "YES", "NO"))
+BIRDSDF2223$BirdProtec <- as.factor(BIRDSDF2223$BirdProtec)
+
+BIRDSDF2223 <- BIRDSDF2223 %>% 
+  mutate(SustCrops = ifelse(grepl("1651011801|1651011802|1651012501|1651012502|1651012503|1651012504|7651012501|8651012501|9651012501", PDR), "YES", "NO"))
+BIRDSDF2223$SustCrops <- as.factor(BIRDSDF2223$SustCrops)
+
+```
+
+## Reclassification of SIGPAC
+
+```{r}
+
+BIRDSDF2223 <- BIRDSDF2223 %>%
+  mutate(SIGPACR = case_when(
+    SIGPAC %in% c("PA", "PR") ~ "Agrosilvopastoral",
+    SIGPAC == "PS" ~ "Extensgrazing",
+    SIGPAC %in% c("OP", "CF", "CS", "CI", "CV", "FF", "FL", "FS", "FV", "FY") ~ "FruitOrchards",
+    SIGPAC %in% c("TA", "TH") ~ "Arable",
+    SIGPAC %in% c("OC", "OV", "OF") ~ "Olivegrooves",
+    SIGPAC %in% c("VF", "VI", "VO") ~ "Vineyards",
+    TRUE ~ "AAOthers"))
+
+BIRDSDF2223$SIGPACR <- as.factor(BIRDSDF2223$SIGPACR)
+
+```
+
+## Weights
+
+```{r include=FALSE}
+
+BIRDSDF2223$W <- ifelse(BIRDSDF2223$PRESENCE == 0, 1000, 1)
+
+```
+
+## Subsets by species
+
+Based on species acronym selected in Part 2 - processing
+
+```{r include=FALSE}
+
+BIRDSDF2223_BO <- subset(BIRDSDF2223, SP == "BO")
+BIRDSDF2223_FN <- subset(BIRDSDF2223, SP == "FN")
+BIRDSDF2223_PA <- subset(BIRDSDF2223, SP == "PA")
+BIRDSDF2223_PO <- subset(BIRDSDF2223, SP == "PO")
+BIRDSDF2223_CP <- subset(BIRDSDF2223, SP == "CP")
+BIRDSDF2223_TT <- subset(BIRDSDF2223, SP == "TT")
+
+```
+
+## Balance of points (optional)
+
+To avoid issues and biases in the models, which include data from 2022 and 2023, we balance the number of points to ensure they are equal for both years
+
+## Model construction
+Repeat for each species and measure combination
+
+```{r}
+
+Model_BiodivSites_BO <- glmmTMB(PRESENCE ~ SIGPACR + BiodivSites * YEAR + (1 | AC/ID),
+                         family = binomial(link = "logit"),
+                         weights = W,
+                         data = BIRDSDF2223_BO)
+
+summary(Model_BiodivSites_BO)
+
+```

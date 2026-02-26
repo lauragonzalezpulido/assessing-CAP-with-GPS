@@ -1,0 +1,147 @@
+---
+title: "4. Annotation of environmental and measures' uptake information"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    collapsed: true
+    smooth_scroll: true
+---
+
+```{r setup, eval=TRUE, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+Addition of environmental covariates and CAP measures uptake information to GPS-GSM tracked points. Part of this code is executed outside the R environment but can also be run within R depending on computer resources and data type.
+
+# Libraries
+
+```{r}
+
+if (!require(dplyr)) install.packages("dplyr")
+if (!require(readr)) install.packages("readr")
+if (!require(sf)) install.packages("sf")
+library(dplyr)
+library(readr)
+library(sf)
+
+```
+
+# Load and prepare data
+
+```{r}
+
+Points_filtered <- read.csv("Points_filtered.csv")
+Points_random <- read.csv("Points_random.csv")
+
+# Add the 'PRESENCE' column: 1 for filtered, 0 for random
+Points_filtered$PRESENCE <- 1
+Points_random$PRESENCE <- 0
+
+# Merge both datasets
+Points_merged <- rbind(Points_filtered, Points_random)
+
+```
+
+# Add a unique identifier for each spatial point
+
+This step is crucial to ensure data integrity during subsequent spatial operations By assigning a unique ID, we prevent potential issues during spatial joins (e.g., duplication of geometries or mismatching data)
+
+```{r}
+
+Points_merged$IDSPATIALPOINT <- seq_len(nrow(Points_merged))
+
+```
+
+# Save the combined data to a CSV file
+
+```{r}
+
+write.csv(Points_merged, "Points_merged.csv", row.names = FALSE)
+
+```
+
+# Spatial Join
+
+Spatial joins can be performed in R using the `st_join()` function from the `sf` package. This allows for merging spatial layers based on their geographic location. However, for large union datasets we strongly recommend using dedicated GIS software like QGIS.
+
+## Steps for Spatial Join in QGIS
+
+1.  Load your data:
+
+    -   Open QGIS and load your layers:
+
+        -   Points layer: This is the merged layer of points with presence and random points. Make sure to import this layer with longitude (lon) as the X-coordinate and latitude (lat) as the Y-coordinate
+
+        -   Polygon layers: Load the Uptake and USE/Cover polygon layers, which represent CAP measures uptake and land use data, respectively.
+
+    -   To load the data, go to Layer \> Add Layer \> Add Vector Layer and select your files.
+
+2.  Check CRS (Coordinate Reference System):
+
+    -   Ensure that both the Points layer and the Polygons layers (Uptake and USE/Cover) are in the correct CRS (coordinate reference system). All layers should ideally be in the same CRS for accurate spatial operations.
+
+3.  Open the "Join attributes by location" tool:
+
+    -   In the Processing Toolbox, search for "Join attributes by location". Alternatively, you can find it under Vector \> Data Management Tools \> Join attributes by location.
+
+4.  Set the parameters:
+
+    -   Input layer: Select the Points layer (the merged points with presence and random points).
+
+    -   Join layer: Select the first Polygon layer (either Uptake or USE/Cover).
+
+    -   Geometric predicate: Choose the spatial relationship that defines how the layers should be joined. Choose "intersects" if you want to join points that fall within or touch the polygons. 
+    
+    - Join type: A many-to-one join means that a single point can match multiple polygons. This is useful when polygons overlap or have duplicated features with complementary information. This will create multiple records for the same point, but we address this later by collapsing these duplicates into a single record per point with "IDSPATIALPOINT".
+    
+    -   Fields to join: Select which fields you want to bring in from the polygons (e.g., Uptake information or USE/Cover attributes).
+
+5.  Run the join:
+
+    -   Click Run to execute the spatial join. QGIS will process the join and create a new layer that combines the attributes from the polygon (Uptake or USE/Cover) with the points based on the spatial relationship (i.e., points that intersect or fall within the polygons).
+
+6.  Repeat the process to join the second polygon layer (either USE/Cover or Uptake, depending on the first join):
+
+    -   Input layer: Select the previously joined points layer.
+
+    -   Join layer: Choose the second polygon layer (either Uptake or USE/Cover).
+
+7.  Inspect the result:
+
+    -   Open the attribute table of the new layer to verify that the attributes from both polygon layers are correctly joined to the points.
+
+8.  Add additional variables if needed:
+
+    -   In this study, an additional variable has been added containing information about the Autonomous Community (AC) where each individual is located. For individuals located at the boundaries of two Autonomous Communities, the one with the highest number of presence points was chosen.
+
+9.  Save the result:
+
+    -   To save the resulting joined layer, right-click the new layer in the Layers Panel and select Export \> Save Features As.
+        -   Choose the format you prefer (e.g., GeoPackage, Shapefile) to store the final result.
+        -   Export as CSV to continue working with the data, by right-clicking the layer and selecting Export \> Save Features As, and choosing CSV as the file type. Save as POINTS_UPTK_USE.csv
+
+# Collapse
+
+The next step involves combining overlapping polygon information for each point. In our dataset, some polygons representing CAP (Common Agricultural Policy) uptake are duplicated, with complementary information split across the duplicates. As a result, a single point can match multiple polygon records. The goal is to group the data by each point’s unique spatial ID and merge the polygon attributes, so that each point ends up with a single, complete record containing all relevant information.
+
+## Collapsing values for each spatial point
+
+```{r}
+
+POINTS_UPTK_USE <- read.csv("POINTS_UPTK_USE.csv")
+
+POINTS_UPTK_USE_COL <- POINTS_UPTK_USE %>%
+  group_by(IDSPATIALPOINT) %>%
+  summarise(across(everything(), ~ paste(unique(.), collapse = "/")), .groups = "drop")
+
+```
+
+# Write csv
+
+```{r}
+
+write_csv(POINTS_UPTK_USE_COL, "POINTS_UPTK_USE_COL.csv")
+
+```

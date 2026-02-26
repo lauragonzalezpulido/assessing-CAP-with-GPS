@@ -1,0 +1,181 @@
+---
+title: "3. Home range and random points"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    collapsed: true
+    smooth_scroll: true
+---
+
+```{r setup, eval=TRUE, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+Calculation of home ranges and generation of random points within each range from GPS-GSM tracking data
+
+# Libraries
+
+```{r}
+
+if (!require(dplyr)) install.packages("dplyr")
+if (!require(readr)) install.packages("readr")
+if (!require(sp)) install.packages("sp")
+if (!require(adehabitatHR)) install.packages("adehabitatHR")
+if (!require(sf)) install.packages("sf")
+
+library(dplyr)
+library(readr)
+library(sp)
+library(adehabitatHR)
+library(sf)
+
+```
+
+# Load and prepare data
+
+```{r}
+
+# Set seed for reproducibility
+
+set.seed(23) # Change if needed
+
+# Load data
+
+processed_data_final <- read_csv("processed_data_final.csv") %>%
+  mutate(
+    x = as.numeric(lon),
+    y = as.numeric(lat),  
+    id = as.factor(SP_ID_YEAR)) %>%  
+  dplyr::select(-hour, -DateTime, -SP, -lon, -lat, -year, -SP_ID_YEAR)
+
+# This code is designed to estimate a separate kernel for each id–year combination (id = "SP_ID_YEAR"), i.e., one kernel for year 1 and another for year 2. This specification was adopted for this analysis because some individuals changed their breeding area between years. Change if needed.
+
+```
+
+# Set parameters
+Adjust as needed depending on species and analysed periods
+
+```{r}
+
+kde_grid_size <- 100
+kde_percent <- 99
+n_random_points <- 10
+
+```
+
+# Calculate kernel and random points over each unique ID
+
+```{r}
+
+filtered_list <- list()  # List to store filtered points
+random_list <- list()  # List to store random points
+
+# Loop over each unique ID in the data
+for (id_value in unique(processed_data_final$id)) {
+  
+  print(paste("Processing id:", id_value))  
+  
+  # Filter data for the current ID
+  df_data <- processed_data_final %>%
+    filter(id == id_value) %>%
+    dplyr::select(x, y)
+    
+  # Skip if too few points (recommended safety check)
+  if (nrow(df_data) < 5) {
+    print("Not enough points. Skipping...")
+    next
+    }
+  
+  # Convert to sf and transform to UTM
+  sf_points <- st_as_sf(df_data, coords = c("x", "y"), crs = 4326)
+  sf_points_utm <- st_transform(sf_points, 25830)
+  
+  # Create Kernel Density Estimate (KDE)
+  kud <- suppressWarnings(
+    kernelUD(
+      as(sf_points_utm, "Spatial"), 
+      h = "href", 
+      grid = kde_grid_size
+      )
+    )
+  
+  if (inherits(kud, "kernelUD")) {
+    print("KDE successful")
+    } else {
+      print("Failed to generate KDE. Skipping.")
+      next
+      }
+  
+  # Extract contour
+  kud_vertices <- try(getverticeshr(kud, percent = kde_percent), silent = TRUE)
+
+    if (inherits(kud_vertices, "try-error")) {
+    print("Failed to extract contour. Skipping.")
+    next
+    }
+  
+  # Convert contours to sf and save as shapefile
+  kud_sf <- st_as_sf(kud_vertices)
+  kud_sf <- st_make_valid(kud_sf)
+  
+  st_write(
+    kud_sf, 
+    paste0("A23_kde", kde_percent,
+           "_grid", kde_grid_size,
+           "_", id_value, ".shp"), 
+    delete_layer = TRUE, 
+    quiet = TRUE
+  )
+  
+  # Filter original points inside KDE
+  sf_points_filtered <- st_as_sf(df_data, coords = c("x", "y"), crs = 4326) %>%
+    st_transform(25830)
+  
+  points_within <- st_join(sf_points_filtered, kud_sf, join = st_within, left = FALSE)
+  
+  # Convert filtered points back to WGS84
+  points_within_wgs <- st_transform(points_within, 4326)
+  coords <- st_coordinates(points_within_wgs)
+  
+  # Create dataframe
+  points_within_df <- points_within_wgs %>%
+    st_drop_geometry() %>%
+    mutate(id = id_value, 
+           lon = coords[, 1], 
+           lat = coords[, 2]
+           ) %>%
+    dplyr::select(id, lon, lat)
+    
+  # Store filtered points
+  filtered_list[[as.character(id_value)]] <- points_within_df
+    
+  # Generate random points within the KDE if valid points exist
+  if (nrow(points_within_df) > 0) {
+    random_points <- st_sample(kud_sf, size = nrow(points_within_df) * n_random_points, type = "random")
+    random_points_wgs <- st_transform(random_points, 4326)
+    coords_random <- st_coordinates(random_points_wgs)
+    
+    # Create a dataframe for the random points
+    random_points_df <- data.frame(id = id_value, lon = coords_random[, 1], lat = coords_random[, 2])
+    
+    # Store random points
+    random_list[[as.character(id_value)]] <- random_points_df
+    }
+  }
+
+```
+
+# Write csv
+
+```{r}
+
+# Combine all filtered points into one dataframe and write to CSV
+write_csv(bind_rows(filtered_list), "Points_filtered.csv")
+
+# Combine all random points into one dataframe and write to CSV
+write_csv(bind_rows(random_list), "Points_random.csv")
+
+```
+

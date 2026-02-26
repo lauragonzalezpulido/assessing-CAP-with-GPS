@@ -1,0 +1,175 @@
+---
+title: "2. GPS-GSM data filtering"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    collapsed: true
+    smooth_scroll: true
+---
+
+```{r setup, eval=TRUE, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+Filtering and preprocessing of GPS-GSM tracking data, including date, species, time-of-day, and hourly aggregation from GPS-GSM tracking data
+
+# Libraries
+
+```{r}
+
+if (!require(dplyr)) install.packages("dplyr")
+if (!require(lubridate)) install.packages("lubridate")
+if (!require(suncalc)) install.packages("suncalc")
+  
+library(dplyr)
+library(lubridate)
+library(suncalc)
+
+```
+
+# Function
+
+```{r}
+
+process_GPS <- function(input_file, output_file, year_to_filter, species_to_filter, start_date, end_date, species_label, time_of_day, time_zone) {
+  
+  if(!file.exists(input_file)) {
+    stop("Input file does not exist!")
+  }
+
+  preprocessed_data <- read.csv(input_file, stringsAsFactors = FALSE)
+  
+  required_columns <- c("DateTime", "species_name", "lat", "lon", "id")
+  if (!all(required_columns %in% colnames(preprocessed_data))) {
+    stop("Input data is missing required columns.")
+  }
+  
+  preprocessed_data$DateTime <- lubridate::ymd_hms(preprocessed_data$DateTime, tz = time_zone)
+
+  
+  if (any(is.na(preprocessed_data$DateTime))) {
+    warning("Some timestamps could not be converted")
+  }
+  
+  # Ensure species_label is a character string
+  if (!is.character(species_label)) {
+    stop("species_label should be a character string.")
+  }
+
+  # Year filtering - Create the 'year' column before filtering
+  preprocessed_data <- preprocessed_data %>%
+    mutate(year = year(DateTime))  # Make sure 'year' is created here
+  
+  # Year filtering
+  preprocessed_data_year <- preprocessed_data %>%
+    filter(year %in% year_to_filter)
+  
+  # Species and date range filtering
+  preprocessed_data_year_sp <- preprocessed_data_year %>% 
+    filter(species_name == species_to_filter,
+           DateTime >= as.POSIXct(start_date, tz = time_zone) & DateTime <= as.POSIXct(end_date, tz = time_zone)) %>%
+    mutate(date = as.Date(DateTime))
+  
+  # Get sunrise and sunset times for the specified time zone
+  sun_times <- getSunlightTimes(
+    data = preprocessed_data_year_sp %>% dplyr::select(date, lat, lon),
+    keep = c("sunrise", "sunset"),
+    tz = time_zone)  
+  
+  # Keep only day-time or night-time locations
+  preprocessed_data_year_sp <- preprocessed_data_year_sp %>%
+    mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+    left_join(
+      sun_times %>% 
+        mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+        dplyr::select(date, lat, lon, sunrise, sunset),
+      by = c("date", "lat", "lon")
+      )
+  
+  if (time_of_day == "day") {
+  preprocessed_data_year_sp <- preprocessed_data_year_sp %>%
+    filter(DateTime >= sunrise & DateTime <= sunset)
+  
+  } else if (time_of_day == "night") {
+    preprocessed_data_year_sp <- preprocessed_data_year_sp %>%
+      filter(DateTime >= sunset | DateTime <= sunrise)
+    
+    } else {
+      stop("time_of_day must be 'day' or 'night'")
+      }
+
+  # Aggregate to 1-Hour frequency and create a unique SP_ID_YEAR column
+  preprocessed_data_year_sp <- preprocessed_data_year_sp %>%
+    mutate(hour = floor_date(DateTime, "hour")) %>%
+    group_by(id, hour) %>%
+    summarise(
+      DateTime = first(DateTime),
+      lat = first(lat),
+      lon = first(lon),
+      SP = species_label,  # Ensure species_label is used correctly
+      year = first(year),  # Ensure 'year' is available here
+      .groups = "drop"
+    ) %>%
+    distinct(id, hour, .keep_all = TRUE) %>%
+    mutate(SP_ID_YEAR = paste(species_label, id, year, sep = "_"))  # Ensure 'year' is used here
+  
+  # Save processed data to CSV
+  write.csv(preprocessed_data_year_sp, output_file, row.names = FALSE)
+  
+  cat("Data processing complete. Processed data saved to:", output_file, "\n")
+}
+
+```
+
+# Set parameters
+
+```{r}
+
+input_file <- "preprocessed_data.csv"
+output_file <- "processed_data_TT_2023.csv"  
+
+# Important: for final join of all data, maintain the name structure "processed_data_", change the following: "SP_YEAR"
+
+year_to_filter <- c(2023) # For a "before/after" analysis, data from two distinct years are required.
+# Repeat the process for each year separately, applying the same date range for year 1 and year 2.
+# This ensures each year is processed with its own time window (start_date and end_date) and avoids mixing dates.
+
+species_to_filter <- "Tetrax tetrax"
+
+start_date <- "2023-07-01 00:00:00"  # YYYY-MM-DD HH:mm:ss
+
+end_date <- "2023-09-30 23:59:59"
+
+species_label <- "TT"
+
+time_of_day <- "day"  # select "day" or "night"
+
+time_zone <- "UTC"
+
+```
+
+# Function excution
+
+```{r}
+
+process_GPS(input_file, output_file, year_to_filter, species_to_filter, start_date, end_date, species_label, time_of_day, time_zone)
+
+```
+
+## Repeat for all species and years changing necessary parameters
+
+Remember to change output file name to avoid data loss
+
+# Bind all files together and write csv
+
+```{r}
+
+processed_data_final <- list.files(pattern = "processed_data_.*\\.csv") %>%
+  lapply(read.csv, stringsAsFactors = FALSE) %>%
+  bind_rows()
+
+write.csv(processed_data_final, "processed_data_final.csv", row.names = FALSE)
+
+```
